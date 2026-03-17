@@ -1,0 +1,147 @@
+name: CI/CD - Build, Push to ACR, Deploy to Dev
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+env:
+  ACR_REGISTRY: ${{ secrets.ACR_LOGIN_SERVER }}
+  IMAGE_NAME: ${{ secrets.ACR_IMAGE_NAME }}
+  ARGOCD_SERVER: ${{ secrets.ARGOCD_SERVER }}
+  ARGOCD_APP_NAME: ${{ secrets.ARGOCD_APP_NAME }}
+  SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+  DEPLOY_MANIFEST_REPO: ${{ secrets.DEPLOY_MANIFEST_REPO }}
+
+jobs:
+
+  # ─────────────────────────────────────────────
+  # Job 1: Run tests and report coverage
+  # ─────────────────────────────────────────────
+  test:
+    name: Test & Quality Gate
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Run tests with coverage
+        run: ./gradlew test jacocoTestReport
+
+      - name: Upload test results
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: build/reports/tests/
+          retention-days: 7
+
+      - name: SonarQube analysis
+        uses: SonarSource/sonarqube-scan-action@v5
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ env.SONAR_HOST_URL }}
+        with:
+          args: >
+            -Dsonar.projectKey=${{ secrets.SONAR_PROJECT_KEY }}
+            -Dsonar.sources=src/main
+            -Dsonar.tests=src/test
+            -Dsonar.java.coveragePlugin=jacoco
+            -Dsonar.coverage.jacoco.xmlReportPaths=build/reports/jacoco/test/jacocoTestReport.xml
+
+  # ─────────────────────────────────────────────
+  # Job 2: Build Docker image and push to ACR
+  # ─────────────────────────────────────────────
+  build-and-push:
+    name: Build & Push to ACR
+    runs-on: ubuntu-latest
+    needs: test
+    outputs:
+      image_tag: ${{ steps.meta.outputs.version }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Build project
+        run: ./gradlew build -x test
+
+      - name: Generate image metadata
+        id: meta
+        run: |
+          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+          VERSION="${SHORT_SHA}"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "full_image=${{ env.ACR_REGISTRY }}/${{ env.IMAGE_NAME }}:${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to Azure Container Registry
+        uses: azure/docker-login@v2
+        with:
+          login-server: ${{ secrets.ACR_LOGIN_SERVER }}
+          username: ${{ secrets.ACR_USERNAME }}
+          password: ${{ secrets.ACR_PASSWORD }}
+
+      - name: Build Docker image
+        run: |
+          docker build \
+            -t ${{ steps.meta.outputs.full_image }} \
+            -t ${{ env.ACR_REGISTRY }}/${{ env.IMAGE_NAME }}:latest \
+            .
+
+      - name: Push Docker image to ACR
+        run: |
+          docker push ${{ steps.meta.outputs.full_image }}
+          docker push ${{ env.ACR_REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+
+  # ─────────────────────────────────────────────
+  # Job 3: Deploy to dev environment via ArgoCD
+  # ─────────────────────────────────────────────
+  deploy-dev:
+    name: Deploy to Dev
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+
+    steps:
+      - name: Checkout deployment manifests
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.DEPLOY_MANIFEST_REPO }}
+          token: ${{ secrets.GH_PAT }}
+          path: manifests
+
+      - name: Update image tag in Kubernetes manifest
+        working-directory: manifests
+        run: |
+          IMAGE_TAG="${{ needs.build-and-push.outputs.image_tag }}"
+          FULL_IMAGE="${{ env.ACR_REGISTRY }}/${{ env.IMAGE_NAME }}:${IMAGE_TAG}"
+          sed -i "s|image:.*${{ env.IMAGE_NAME }}.*|image: ${FULL_IMAGE}|g" \
+            overlays/dev/deployment.yaml
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .
+          git commit -m "chore(dev): update image to ${IMAGE_TAG}" || echo "No changes to commit"
+          git push
+
+      - name: Trigger ArgoCD sync
+        run: |
+          argocd login ${{ env.ARGOCD_SERVER }} \
+            --username ${{ secrets.ARGOCD_USERNAME }} \
+            --password ${{ secrets.ARGOCD_PASSWORD }} \
+            --insecure
+          argocd app sync ${{ env.ARGOCD_APP_NAME }}
